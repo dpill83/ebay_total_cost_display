@@ -9,7 +9,7 @@ $(function() {
   };
 
   try {
-    log.info('[ebay-total-cost] DOM ready. href=%s readyState=%s jQuery=%s', location.href, document.readyState, (window.jQuery && jQuery.fn && jQuery.fn.jquery) || 'missing');
+    log.info('[ebay-total-cost] DOM ready. href=%s readyState=%s jQuery=%s iframe=%s', location.href, document.readyState, (window.jQuery && jQuery.fn && jQuery.fn.jquery) || 'missing', window !== window.top);
   } catch (e) {
     // no-op
   }
@@ -18,11 +18,12 @@ $(function() {
     var $ = jQuery;
     var maxPasses = 20; // ~10s with 500ms interval
     var intervalMs = 500;
+    var isRunning = false;
 
     function runInjectionPass(passNumber) {
       try {
         log.info('[ebay-total-cost] Injection pass #%d', passNumber);
-        var items = $('.s-item, .sresult, .s-card');
+        var items = $('.s-item, .sresult, .s-card, .cim-results-rows-view__row, [data-testid*="listing"], .listing-item, .item-row');
         log.info('[ebay-total-cost] Candidate items found: %d', items.length);
 
         items.each(function(index) {
@@ -32,8 +33,8 @@ $(function() {
               log.info('[ebay-total-cost] #%d already processed, skipping item', index);
               return;
             }
-            var $priceNode = details.find('.s-item__price, .lvprice, .s-card__price');
-            var $shipNode = details.find('.s-item__logisticsCost, .s-item__shipping, .ship .fee');
+            var $priceNode = details.find('.s-item__price, .lvprice, .s-card__price, .cim-results-rows-view__row-price, [data-testid*="price"], .price, .item-price');
+            var $shipNode = details.find('.s-item__logisticsCost, .s-item__shipping, .ship .fee, .cim-results-rows-view__row-shipping, [data-testid*="shipping"], .shipping, .ship-cost');
             var alreadyInjectedInItem = details.find('.ebay-total-cost').length > 0 || ($priceNode.text() || '').indexOf('(Total Cost:') !== -1;
             if (alreadyInjectedInItem) {
               log.info('[ebay-total-cost] #%d already injected, skipping item', index);
@@ -42,6 +43,30 @@ $(function() {
             var priceText = $priceNode.clone().find('.ebay-total-cost').remove().end().text();
             priceText = priceText.replace(/\(\s*Total\s+Cost:[^)]+\)/i, '');
             var shipText = $shipNode.text();
+            
+            // If we didn't find price/shipping with selectors, try to find them in the text content
+            if (!priceText || !shipText) {
+              var itemText = details.text() || '';
+              
+              // Look for price patterns like $1.03, $5.29, etc.
+              if (!priceText) {
+                var priceMatch = itemText.match(/\$[\d,]+\.?\d*/);
+                if (priceMatch) {
+                  priceText = priceMatch[0];
+                  log.info('[ebay-total-cost] #%d found price in text: %s', index, priceText);
+                }
+              }
+              
+              // Look for shipping patterns like +$1.25 shipping, +$0.03 shipping, etc.
+              if (!shipText) {
+                var shipMatch = itemText.match(/\+?\$[\d,]+\.?\d*\s*(?:shipping|delivery)/i);
+                if (shipMatch) {
+                  shipText = shipMatch[0];
+                  log.info('[ebay-total-cost] #%d found shipping in text: %s', index, shipText);
+                }
+              }
+            }
+            
             if (!shipText) {
               try {
                 var $attrRows = details.find('.su-card-container__attributes__primary .s-card__attribute-row');
@@ -65,33 +90,55 @@ $(function() {
               if (details.find('.ebay-total-cost').length === 0) {
                 var injected = false;
                 var $totalCostElement = $('<span class="ebay-total-cost">(Total Cost: $' + number_format(totalNum, 2) + ')</span>');
-                var $priceRow = $priceNode.closest('.s-card__attribute-row');
-                if ($priceRow.length) {
-                  // Insert a new attribute row right after the price row
-                  var $newRow = $('<div class="s-card__attribute-row"></div>').append($('<span class="su-styled-text secondary large"></span>').append($totalCostElement));
-                  $priceRow.after($newRow);
-                  log.info('[ebay-total-cost] #%d injected total after price row', index);
-                  injected = true;
-                } else if ($priceNode.length) {
-                  // Fallback: place next to price node
-                  $priceNode.after($totalCostElement);
-                  log.info('[ebay-total-cost] #%d injected total next to price node', index);
-                  injected = true;
-                } else {
-                  // Try attributes container within s-card
-                  var $attrsContainer = details.find('.su-card-container__attributes__primary, .s-card__attributes').first();
-                  if ($attrsContainer.length) {
-                    var $row = $('<div class="s-card__attribute-row"></div>').append($('<span class="su-styled-text secondary large"></span>').append($totalCostElement));
-                    $attrsContainer.append($row);
-                    log.info('[ebay-total-cost] #%d injected total into attributes container', index);
+                
+                // Check if this is a pricing research modal row or similar structure
+                if (details.hasClass('cim-results-rows-view__row') || details.find('[data-testid*="listing"]').length > 0) {
+                  // For pricing research modal, add total cost after the shipping row
+                  if ($shipNode.length) {
+                    $shipNode.after($totalCostElement);
+                    log.info('[ebay-total-cost] #%d injected total after shipping in pricing research', index);
+                    injected = true;
+                  } else if ($priceNode.length) {
+                    $priceNode.after($totalCostElement);
+                    log.info('[ebay-total-cost] #%d injected total after price in pricing research', index);
                     injected = true;
                   } else {
-                    // Last resort: append to item root
+                    // Fallback: append to the end of the item
                     details.append($totalCostElement);
-                    log.info('[ebay-total-cost] #%d injected total at item root', index);
+                    log.info('[ebay-total-cost] #%d injected total at end of pricing research item', index);
                     injected = true;
                   }
+                } else {
+                  // Original logic for regular eBay pages
+                  var $priceRow = $priceNode.closest('.s-card__attribute-row');
+                  if ($priceRow.length) {
+                    // Insert a new attribute row right after the price row
+                    var $newRow = $('<div class="s-card__attribute-row"></div>').append($('<span class="su-styled-text secondary large"></span>').append($totalCostElement));
+                    $priceRow.after($newRow);
+                    log.info('[ebay-total-cost] #%d injected total after price row', index);
+                    injected = true;
+                  } else if ($priceNode.length) {
+                    // Fallback: place next to price node
+                    $priceNode.after($totalCostElement);
+                    log.info('[ebay-total-cost] #%d injected total next to price node', index);
+                    injected = true;
+                  } else {
+                    // Try attributes container within s-card
+                    var $attrsContainer = details.find('.su-card-container__attributes__primary, .s-card__attributes').first();
+                    if ($attrsContainer.length) {
+                      var $row = $('<div class="s-card__attribute-row"></div>').append($('<span class="su-styled-text secondary large"></span>').append($totalCostElement));
+                      $attrsContainer.append($row);
+                      log.info('[ebay-total-cost] #%d injected total into attributes container', index);
+                      injected = true;
+                    } else {
+                      // Last resort: append to item root
+                      details.append($totalCostElement);
+                      log.info('[ebay-total-cost] #%d injected total at item root', index);
+                      injected = true;
+                    }
+                  }
                 }
+                
                 if (injected) {
                   details.addClass('ebtc-processed');
                 }
@@ -109,25 +156,104 @@ $(function() {
         var remaining = 0;
         items.each(function() {
           var $item = $(this);
-          var $priceNodeCheck = $item.find('.s-item__price, .lvprice');
+          var $priceNodeCheck = $item.find('.s-item__price, .lvprice, .cim-results-rows-view__row-price, [data-testid*="price"], .price, .item-price');
           var alreadyInjected = $item.find('.ebay-total-cost').length > 0 || ($priceNodeCheck.text() || '').indexOf('(Total Cost:') !== -1;
           if (!alreadyInjected) remaining++;
         });
 
-        if (items.length === 0 && passNumber < maxPasses) {
+        if (items.length === 0 && passNumber < maxPasses && isRunning) {
           setTimeout(function() { runInjectionPass(passNumber + 1); }, intervalMs);
-        } else if (remaining > 0 && passNumber < maxPasses) {
+        } else if (remaining > 0 && passNumber < maxPasses && isRunning) {
           log.info('[ebay-total-cost] Remaining items without totals: %d — scheduling another pass', remaining);
           setTimeout(function() { runInjectionPass(passNumber + 1); }, intervalMs);
         } else if (remaining === 0) {
           log.info('[ebay-total-cost] All visible items injected — stopping');
+          isRunning = false;
+        } else if (passNumber >= maxPasses) {
+          log.info('[ebay-total-cost] Max passes reached — stopping');
+          isRunning = false;
         }
       } catch (err) {
         log.error('[ebay-total-cost] Fatal error during injection pass #%d:', passNumber, err);
       }
     }
 
-    runInjectionPass(1);
+    function startInjection() {
+      if (isRunning) return;
+      isRunning = true;
+      runInjectionPass(1);
+    }
+    
+    function stopInjection() {
+      isRunning = false;
+    }
+    
+    // Start initial injection
+    startInjection();
+    
+    // Set up MutationObserver to detect dynamic content changes
+    try {
+      var observer = new MutationObserver(function(mutations) {
+        var shouldRestart = false;
+        mutations.forEach(function(mutation) {
+          if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+            // Check if any added nodes contain our target elements
+            for (var i = 0; i < mutation.addedNodes.length; i++) {
+              var node = mutation.addedNodes[i];
+              if (node.nodeType === 1) { // Element node
+                var $node = $(node);
+                if ($node.find('.s-item, .sresult, .s-card, .cim-results-rows-view__row, [data-testid*="listing"], .listing-item, .item-row').length > 0 ||
+                    $node.is('.s-item, .sresult, .s-card, .cim-results-rows-view__row, [data-testid*="listing"], .listing-item, .item-row')) {
+                  shouldRestart = true;
+                  break;
+                }
+              }
+            }
+          }
+        });
+        
+        if (shouldRestart) {
+          log.info('[ebay-total-cost] New content detected, restarting injection');
+          stopInjection();
+          setTimeout(function() {
+            startInjection();
+          }, 100);
+        }
+      });
+      
+      // Start observing
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true
+      });
+      
+      log.info('[ebay-total-cost] MutationObserver started');
+    } catch (e) {
+      log.warn('[ebay-total-cost] MutationObserver failed:', e);
+    }
+    
+    // Additional periodic check for pricing research modal
+    setInterval(function() {
+      if (!isRunning) {
+        var pricingModal = $('.cim-results-rows-view__row, [data-testid*="listing"]');
+        if (pricingModal.length > 0) {
+          var hasUnprocessed = false;
+          pricingModal.each(function() {
+            var $item = $(this);
+            if (!$item.hasClass('ebtc-processed') && $item.find('.ebay-total-cost').length === 0) {
+              hasUnprocessed = true;
+              return false; // break
+            }
+          });
+          
+          if (hasUnprocessed) {
+            log.info('[ebay-total-cost] Periodic check found unprocessed items, restarting');
+            startInjection();
+          }
+        }
+      }
+    }, 3000); // Check every 3 seconds
+    
   }, 100);
 
   function makeANumber(str) {
