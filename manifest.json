@@ -1,6 +1,6 @@
 {
    "manifest_version": 3,
-   "name": "ebay Total Cost Display",
+   "name": "eBay Total Cost Display",
    "version": "2.0.4",
    "description": "Show the total price/cost of ebay items (price+shipping)",
    "icons": {
